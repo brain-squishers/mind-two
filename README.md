@@ -44,6 +44,38 @@ conda activate sam2
 pip install -e .
 ```
 
+If `pip install -e .` fails because the initial dependency install is too large for your temporary storage, install the heavy packages first and then retry the editable install without build isolation:
+
+```bash
+pip install torch torchvision numpy
+pip install --no-build-isolation -e .
+```
+
+If the second command fails with a CUDA mismatch error such as:
+
+```text
+RuntimeError: The detected CUDA version (13.1) mismatches the version that was used to compile PyTorch (12.8)
+```
+
+then the CUDA toolkit used for building the SAM 2 extension does not match the CUDA version embedded in your PyTorch wheel. Keep the PyTorch version you already installed, add a matching CUDA toolkit to the conda environment, and point the build to that toolkit:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
+
+conda install -c nvidia cuda-nvcc=12.8 cuda-cudart-dev=12.8
+export CUDA_HOME="$CONDA_PREFIX"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+
+which nvcc
+nvcc --version
+python -c "import torch; print(torch.version.cuda)"
+
+pip install --no-build-isolation -e .
+```
+
+Before retrying the install, make sure both `nvcc --version` and `torch.version.cuda` report the same CUDA version.
+
 2. Download SAM 2 checkpoints
 
 ```bash
