@@ -14,6 +14,88 @@ The current live pipeline combines:
 
 The main entrypoint is [run_live.py](/home/kevin/Documents/Projects/mind-two/run_live.py).
 
+## Toolchain Setup
+
+The runtime is split into a few concrete layers:
+
+- Query input layer
+  - Text mode uses a one-shot static query.
+  - Audio mode listens for a wake phrase, records a spoken command, and transcribes it with OpenAI speech-to-text.
+  - Code: [live_io/query_input.py](/home/kevin/Documents/Projects/mind-two/live_io/query_input.py), [live_io/audio_input.py](/home/kevin/Documents/Projects/mind-two/live_io/audio_input.py)
+
+- Frame input layer
+  - Webcam mode reads directly from a local camera.
+  - Server mode polls the latest JPEG frame from the FastAPI stream endpoint.
+  - Code: [live_io/frame_source.py](/home/kevin/Documents/Projects/mind-two/live_io/frame_source.py), [rtc_client_server/server.py](/home/kevin/Documents/Projects/mind-two/rtc_client_server/server.py)
+
+- Query understanding layer
+  - The GPT model rewrites the user request into structured target, anchor, and support-surface phrases.
+  - The runtime can override anchors with a fixed configured list.
+  - Code: [llm/openie.txt](/home/kevin/Documents/Projects/mind-two/llm/openie.txt), [live/query_pipeline.py](/home/kevin/Documents/Projects/mind-two/live/query_pipeline.py)
+
+- Detection and tracking layer
+  - Grounding DINO performs text-conditioned detection.
+  - SAM 2 initializes masks from detection boxes and then tracks over time.
+  - Code: [live/tracking_pipeline.py](/home/kevin/Documents/Projects/mind-two/live/tracking_pipeline.py), [live_runtime.py](/home/kevin/Documents/Projects/mind-two/live_runtime.py)
+
+- Depth and scene reasoning layer
+  - Depth Anything V2 Metric estimates full-frame depth.
+  - The runtime reads depth only inside tracked masks and computes scene relations.
+  - Code: [live/depth_pipeline.py](/home/kevin/Documents/Projects/mind-two/live/depth_pipeline.py), [live/scene_pipeline.py](/home/kevin/Documents/Projects/mind-two/live/scene_pipeline.py)
+
+- Memory and output layer
+  - Recent target observations are stored in scene memory.
+  - The OpenCV overlay displays tracking state, depth, relations, and memory fallback messages.
+  - Code: [live/memory_pipeline.py](/home/kevin/Documents/Projects/mind-two/live/memory_pipeline.py), [scene_memory.py](/home/kevin/Documents/Projects/mind-two/scene_memory.py), [live/overlay_renderer.py](/home/kevin/Documents/Projects/mind-two/live/overlay_renderer.py)
+
+## Model Pipeline
+
+The live path in [run_live.py](/home/kevin/Documents/Projects/mind-two/run_live.py) works like this:
+
+1. Input enters as either:
+   - a text query from `--query`, or
+   - an audio command captured after the wake phrase `hello`
+
+2. The query is queued and sent to the LLM extraction step.
+   - The extraction produces:
+     - `targets`
+     - `anchors`
+     - `support_surfaces`
+
+3. Anchor selection is resolved.
+   - Default: fixed anchors
+   - Optional: LLM-derived anchors
+
+4. Grounding DINO runs on the current frame for the active target phrase.
+   - This produces candidate boxes for target initialization or re-detection.
+
+5. SAM 2 loads the frame and initializes tracked objects from those boxes.
+   - After initialization, SAM 2 handles intermediate tracking updates between re-detections.
+
+6. Depth Anything V2 Metric runs on the full frame in a background worker.
+   - The runtime samples depth values only inside the tracked SAM masks.
+   - Median object depth is used for the distance overlay and scene reasoning.
+
+7. Context detections can run in parallel.
+   - Anchor detections
+   - Support-surface detections
+   - Optional hand detections
+
+8. Scene reasoning and memory update from the tracked target state.
+   - Spatial relations are computed from target, anchors, supports, and hand context.
+   - Stable target observations can be written into scene memory.
+
+9. The UI overlay renders the current state.
+   - query summary
+   - tracking labels
+   - depth estimates
+   - spatial relations
+   - memory fallback text when tracking is lost
+
+In short:
+
+`query/audio` -> `LLM extraction` -> `Grounding DINO boxes` -> `SAM 2 tracking` -> `Depth Anything masked distance` -> `scene reasoning + memory` -> `overlay`
+
 ## Setup
 
 Create an environment and install:
