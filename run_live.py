@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import collections
+import re
 
 import cv2
 import numpy as np
@@ -21,6 +22,11 @@ from utils import add_text_with_background
 
 
 print("device", device)
+
+
+def format_query_label(text):
+    label = re.sub(r"[\s\.,;:!?]+$", "", text.strip())
+    return label or "object"
 
 
 async def main(
@@ -77,6 +83,7 @@ async def main(
 
     current_query = query
     text = ""
+    current_label = "object"
 
     tracking_ready = False
     last_mask_rgb = None
@@ -89,6 +96,8 @@ async def main(
     pending_depth_request = None
     latest_mask_ratio = 0.0
     stable_mask_count = 0
+    obj_display_names = {}
+    latest_label_positions = {}
 
     frame_count = 0
     processed_frames = 0
@@ -142,12 +151,15 @@ async def main(
                             ]
                             boxes = boxes[top_indices]
                         predictor.load_first_frame(detection_result["frame"])
+                        obj_display_names = {}
                         for i, box in enumerate(boxes):
+                            obj_id = i + 1
                             predictor.add_new_points(
                                 frame_idx=0,
-                                obj_id=i + 1,
+                                obj_id=obj_id,
                                 box=box,
                             )
+                            obj_display_names[obj_id] = f"{current_label} #{obj_id}"
                         tracking_ready = True
                         last_mask_rgb = None
                         low_mask_count = 0
@@ -161,6 +173,7 @@ async def main(
 
             if response_queue:
                 text = response_queue.popleft()
+                current_label = format_query_label(text)
                 tracking_ready = False
                 last_mask_rgb = None
                 low_mask_count = 0
@@ -173,6 +186,8 @@ async def main(
                 pending_depth_request = None
                 latest_mask_ratio = 0.0
                 stable_mask_count = 0
+                obj_display_names = {}
+                latest_label_positions = {}
 
             should_process = frame_count == 1 or frame_count % skip_frames == 0
 
@@ -229,7 +244,9 @@ async def main(
                         width, height = frame.shape[:2][::-1]
                         all_mask = np.zeros((height, width, 1), dtype=np.uint8)
                         current_depth_stats = {}
+                        current_label_positions = {}
                         for i in range(len(out_obj_ids)):
+                            obj_id = int(out_obj_ids[i])
                             binary_mask = (
                                 (out_mask_logits[i] > 0.0)
                                 .squeeze(0)
@@ -239,6 +256,12 @@ async def main(
                             )
                             out_mask = binary_mask[:, :, None] * 255
                             all_mask = cv2.bitwise_or(all_mask, out_mask)
+                            ys, xs = np.nonzero(binary_mask)
+                            if xs.size != 0:
+                                current_label_positions[obj_id] = (
+                                    int(xs.mean()),
+                                    int(ys.mean()),
+                                )
                             if enable_depth and latest_depth_map is not None:
                                 stats = compute_mask_depth_stats(
                                     latest_depth_map,
@@ -248,10 +271,11 @@ async def main(
                                     max_depth=depth_max_depth,
                                 )
                                 if stats is not None:
-                                    current_depth_stats[int(out_obj_ids[i])] = stats
+                                    current_depth_stats[obj_id] = stats
 
                         if len(out_obj_ids) != 0:
                             latest_depth_stats = current_depth_stats
+                            latest_label_positions = current_label_positions
                             last_mask_rgb = cv2.cvtColor(all_mask, cv2.COLOR_GRAY2RGB)
                             mask_pixels = int(np.count_nonzero(all_mask))
                             mask_ratio = mask_pixels / float(width * height)
@@ -280,12 +304,14 @@ async def main(
                                 latest_depth_stats = {}
                                 latest_mask_ratio = 0.0
                                 stable_mask_count = 0
+                                latest_label_positions = {}
                                 print("tracking lost; returning to detection")
                         else:
                             last_mask_rgb = None
                             latest_depth_stats = {}
                             latest_mask_ratio = 0.0
                             stable_mask_count = 0
+                            latest_label_positions = {}
                             low_mask_count += 1
                             print("track produced no object ids; cache cleared")
                             if low_mask_count >= lost_patience:
@@ -297,6 +323,7 @@ async def main(
                                 latest_depth_stats = {}
                                 latest_mask_ratio = 0.0
                                 stable_mask_count = 0
+                                latest_label_positions = {}
                                 print("tracking lost; returning to detection")
 
             if last_mask_rgb is not None:
@@ -357,6 +384,21 @@ async def main(
                         cv2.LINE_AA,
                     )
                     y += 28
+            for obj_id, position in latest_label_positions.items():
+                label = obj_display_names.get(obj_id, f"{current_label} #{obj_id}")
+                depth_suffix = ""
+                if obj_id in latest_depth_stats:
+                    depth_suffix = f" {latest_depth_stats[obj_id]['median_m']:.1f} m"
+                cv2.putText(
+                    display_frame,
+                    f"{label}{depth_suffix}",
+                    position,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
 
             cv2.imshow("run_live", display_frame)
             key = cv2.waitKey(1) & 0xFF
