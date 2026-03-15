@@ -68,7 +68,11 @@ def load_model(model):
 
 
 async def main(
-    model="gpt-4o-2024-05-13", camera_index=0, video_path=None, max_frames=50
+    model="gpt-4o-2024-05-13",
+    camera_index=0,
+    video_path=None,
+    max_frames=50,
+    live=False,
 ):
     # load model
     grounding_processor, grounding_model, predictor, llm = load_model(model)
@@ -83,7 +87,7 @@ async def main(
     query_queue = collections.deque([])
     response_queue = collections.deque([])
     if_init = False
-    frame_list = []  # for visualization
+    frame_list = []  # for visualization in batch mode
     text = ""
     query = ""
     results = None
@@ -93,7 +97,7 @@ async def main(
     while True:
         idx += 1
         print(idx)
-        if max_frames is not None and idx > max_frames:
+        if not live and max_frames is not None and idx > max_frames:
             break
         ret, frame = cap.read()
         if not ret:
@@ -105,9 +109,9 @@ async def main(
             # query = "I am thirsty"
             query = "I am trying to find my glass"
             query_queue.append(query)
-        if idx == 51:
-            query = "find a tool for writing."
-            query_queue.append(query)
+        # if idx == 51:
+        #     query = "find a tool for writing."
+        #     query_queue.append(query)
 
         if query_queue:
             query = query_queue.popleft()
@@ -177,21 +181,21 @@ async def main(
         if query:
             frame = add_text_with_background(frame, query)
 
-            # cv2.imshow("frame", frame)
-            # cv2.imwrite(f"output/frame_{idx}.jpg", frame)
-            # idx += 1
+        if live:
+            cv2.imshow("frame", frame)
 
         # Ensure tasks are running
         await asyncio.sleep(0)
 
-        frame_list.append(frame)
-        # result.write(frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+        if live:
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+        else:
+            frame_list.append(frame)
 
-    # visualization
-    frame_list = [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in frame_list]
-    gif = imageio.mimsave("./result.gif", frame_list, "GIF")
+    if not live and frame_list:
+        frame_list = [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in frame_list]
+        imageio.mimsave("./result.gif", frame_list, "GIF")
     # w, h = frame_list[0].shape[:2][::-1]
     # fps = cap.get(cv2.CAP_PROP_FPS)
     # # video_handler = cv2.VideoWriter("result.mp4", cv2.VideoWriter_fourcc(*"MP4V"),25,(w,h))
@@ -222,6 +226,11 @@ if __name__ == "__main__":
         default=50,
         help="Maximum number of frames to process before stopping.",
     )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Run live preview mode instead of saving a GIF.",
+    )
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument(
         "--camera-index",
@@ -240,5 +249,6 @@ if __name__ == "__main__":
             camera_index=args.camera_index,
             video_path=args.video_path,
             max_frames=args.max_frames,
+            live=args.live,
         )
     )
