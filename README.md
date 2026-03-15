@@ -16,6 +16,15 @@ The main entrypoint is [run_live.py](/home/kevin/Documents/Projects/mind-two/run
 
 ## Toolchain Setup
 
+![Architecture overview](./assets/v3_vlm.png)
+
+High-level architecture for the current live perception pipeline.
+
+[![Watch the demo](https://img.youtube.com/vi/kxXIVC9BiPU/0.jpg)](https://www.youtube.com/watch?v=kxXIVC9BiPU)
+
+Demo video:
+https://www.youtube.com/watch?v=kxXIVC9BiPU
+
 The runtime is split into a few concrete layers:
 
 - Query input layer
