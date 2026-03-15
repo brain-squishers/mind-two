@@ -186,6 +186,7 @@ def compute_mask_depth_stats(
 
     return {
         "median_m": float(np.median(depth_values)),
+        "std_m": float(np.std(depth_values)),
         "p25_m": float(np.percentile(depth_values, 25)),
         "p75_m": float(np.percentile(depth_values, 75)),
         "count": int(depth_values.size),

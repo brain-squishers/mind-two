@@ -19,6 +19,7 @@ from live_runtime import (
     load_model,
 )
 from spatial_reasoning import (
+    build_spatial_index,
     compute_iou_xyxy,
     compute_target_relations,
     mask_to_xyxy,
@@ -28,6 +29,8 @@ from utils import add_text_with_background
 
 
 print("device", device)
+
+DEFAULT_HAND_QUERY = "hand"
 
 
 def format_query_label(text):
@@ -197,10 +200,8 @@ async def main(
     max_objects=3,
     box_threshold=0.35,
     text_threshold=0.25,
-    target_box_threshold=0.30,
-    target_text_threshold=0.25,
-    fallback_target_box_threshold=0.22,
-    fallback_target_text_threshold=0.18,
+    target_box_threshold=0.36,
+    target_text_threshold=0.30,
     query="I am trying to find my glass",
     enable_depth=True,
     depth_encoder="vits",
@@ -217,6 +218,12 @@ async def main(
     support_redetect_every=75,
     anchor_cache_ttl=60,
     support_cache_ttl=90,
+    enable_hand_detection=False,
+    hand_query=DEFAULT_HAND_QUERY,
+    hand_redetect_every=10,
+    hand_cache_ttl=25,
+    hand_box_threshold=0.25,
+    hand_text_threshold=0.20,
 ):
     grounding_processor, grounding_model, predictor, llm = load_model(model)
     if enable_depth:
@@ -249,7 +256,6 @@ async def main(
     current_query_summary = query
     target_queries = []
     target_query_index = 0
-    target_fallback_active = False
     anchor_queries = []
     support_surface_queries = []
     active_target_query = ""
@@ -273,15 +279,19 @@ async def main(
     latest_target_boxes = []
     latest_anchor_detections = []
     latest_support_detections = []
+    latest_hand_detections = []
     latest_relations = []
+    latest_spatial_index = {}
     latest_anchor_frame_idx = -1
     latest_support_frame_idx = -1
+    latest_hand_frame_idx = -1
 
     frame_count = 0
     processed_frames = 0
     pending_detection_request = None
     pending_anchor_request = None
     pending_support_request = None
+    pending_hand_request = None
     force_redetect = True
     fps_tracker = FpsTracker()
 
@@ -362,7 +372,6 @@ async def main(
                                 low_mask_count = 0
                                 tracking_steps = 0
                                 force_redetect = False
-                                target_fallback_active = False
                             else:
                                 if target_query_index + 1 < len(target_queries):
                                     target_query_index += 1
@@ -383,27 +392,6 @@ async def main(
                                     print(
                                         "switching target candidate to:",
                                         active_target_query,
-                                    )
-                                elif not target_fallback_active:
-                                    target_fallback_active = True
-                                    target_query_index = 0
-                                    active_target_query = get_active_target_query(
-                                        target_queries,
-                                        target_query_index,
-                                    )
-                                    current_label = format_query_label(
-                                        active_target_query
-                                    )
-                                    current_query_summary = format_query_summary(
-                                        target_queries,
-                                        anchor_queries,
-                                        support_surface_queries,
-                                        active_target_query=active_target_query,
-                                    )
-                                    force_redetect = True
-                                    print(
-                                        "switching target search to fallback "
-                                        f"thresholds with candidate: {active_target_query}"
                                     )
                                 else:
                                     force_redetect = True
@@ -432,6 +420,15 @@ async def main(
                             )
                             latest_support_frame_idx = processed_frames
                         pending_support_request = None
+                    elif job_type == "hand":
+                        if detection_result["text"] == hand_query:
+                            print(f"hand boxes: {result['boxes'].shape[0]}")
+                            latest_hand_detections = extract_labeled_boxes(
+                                result,
+                                [hand_query],
+                            )
+                            latest_hand_frame_idx = processed_frames
+                        pending_hand_request = None
 
             if query_queue:
                 pending_query = query_queue.popleft()
@@ -441,7 +438,6 @@ async def main(
                 extraction = response_queue.popleft()
                 target_queries = extraction["targets"]
                 target_query_index = 0
-                target_fallback_active = False
                 anchor_queries = extraction["anchors"]
                 support_surface_queries = extraction["support_surfaces"]
                 active_target_query = get_active_target_query(
@@ -472,6 +468,7 @@ async def main(
                 pending_detection_request = None
                 pending_anchor_request = None
                 pending_support_request = None
+                pending_hand_request = None
                 force_redetect = True
                 latest_depth_map = None
                 latest_depth_frame_idx = -1
@@ -484,9 +481,12 @@ async def main(
                 latest_target_boxes = []
                 latest_anchor_detections = []
                 latest_support_detections = []
+                latest_hand_detections = []
                 latest_relations = []
+                latest_spatial_index = {}
                 latest_anchor_frame_idx = -1
                 latest_support_frame_idx = -1
+                latest_hand_frame_idx = -1
 
             should_process = frame_count == 1 or frame_count % skip_frames == 0
 
@@ -507,6 +507,14 @@ async def main(
                 ):
                     latest_support_detections = []
                     latest_support_frame_idx = -1
+
+                if (
+                    latest_hand_frame_idx >= 0
+                    and hand_cache_ttl > 0
+                    and processed_frames - latest_hand_frame_idx > hand_cache_ttl
+                ):
+                    latest_hand_detections = []
+                    latest_hand_frame_idx = -1
 
                 if not tracking_ready:
                     should_redetect = (
@@ -530,16 +538,8 @@ async def main(
                             active_target_query,
                             request_id,
                             job_type="target",
-                            box_threshold=(
-                                fallback_target_box_threshold
-                                if target_fallback_active
-                                else target_box_threshold
-                            ),
-                            text_threshold=(
-                                fallback_target_text_threshold
-                                if target_fallback_active
-                                else target_text_threshold
-                            ),
+                            box_threshold=target_box_threshold,
+                            text_threshold=target_text_threshold,
                         )
                         if submitted:
                             pending_detection_request = request_id
@@ -642,10 +642,13 @@ async def main(
                                 latest_label_positions = {}
                                 latest_target_boxes = []
                                 latest_relations = []
+                                latest_spatial_index = {}
                                 latest_anchor_detections = []
                                 latest_support_detections = []
+                                latest_hand_detections = []
                                 latest_anchor_frame_idx = -1
                                 latest_support_frame_idx = -1
+                                latest_hand_frame_idx = -1
                                 print("tracking lost; returning to detection")
                         else:
                             last_mask_rgb = None
@@ -655,10 +658,13 @@ async def main(
                             latest_label_positions = {}
                             latest_target_boxes = []
                             latest_relations = []
+                            latest_spatial_index = {}
                             latest_anchor_detections = []
                             latest_support_detections = []
+                            latest_hand_detections = []
                             latest_anchor_frame_idx = -1
                             latest_support_frame_idx = -1
+                            latest_hand_frame_idx = -1
                             low_mask_count += 1
                             print("track produced no object ids; cache cleared")
                             if low_mask_count >= lost_patience:
@@ -675,10 +681,13 @@ async def main(
                                 latest_label_positions = {}
                                 latest_target_boxes = []
                                 latest_relations = []
+                                latest_spatial_index = {}
                                 latest_anchor_detections = []
                                 latest_support_detections = []
+                                latest_hand_detections = []
                                 latest_anchor_frame_idx = -1
                                 latest_support_frame_idx = -1
+                                latest_hand_frame_idx = -1
                                 print("tracking lost; returning to detection")
 
                 can_schedule_context = (
@@ -686,6 +695,27 @@ async def main(
                     and active_target_query
                     and tracking_ready
                 )
+
+                should_refresh_hands = (
+                    enable_hand_detection
+                    and can_schedule_context
+                    and hand_query
+                    and hand_redetect_every > 0
+                    and processed_frames % hand_redetect_every == 0
+                )
+                if should_refresh_hands:
+                    request_id = processed_frames
+                    if pending_hand_request != request_id:
+                        submitted = grounding_worker.submit(
+                            frame,
+                            hand_query,
+                            request_id,
+                            job_type="hand",
+                            box_threshold=hand_box_threshold,
+                            text_threshold=hand_text_threshold,
+                        )
+                        if submitted:
+                            pending_hand_request = request_id
 
                 should_refresh_anchors = (
                     can_schedule_context
@@ -724,6 +754,17 @@ async def main(
                             pending_support_request = request_id
 
                 latest_relations = compute_target_relations(
+                    frame.shape,
+                    current_label,
+                    latest_target_boxes,
+                    latest_depth_stats,
+                    latest_anchor_detections,
+                    latest_support_detections,
+                    latest_hand_detections,
+                    depth_map=latest_depth_map,
+                    max_depth=depth_max_depth,
+                )
+                latest_spatial_index = build_spatial_index(
                     frame.shape,
                     current_label,
                     latest_target_boxes,
@@ -812,6 +853,24 @@ async def main(
                 )
             draw_box_detections(display_frame, latest_anchor_detections, (0, 200, 255))
             draw_box_detections(display_frame, latest_support_detections, (255, 0, 200))
+            target_entry = latest_spatial_index.get("target_1")
+            if target_entry is not None:
+                x_m, y_m, z_m = target_entry["position_3d_m"]
+                depth_std_m = target_entry["depth_std_m"]
+                xyz_text = f"xyz {x_m:.2f}, {y_m:.2f}, {z_m:.2f} m"
+                if depth_std_m is not None:
+                    xyz_text += f" +- {depth_std_m:.2f}"
+                cv2.putText(
+                    display_frame,
+                    xyz_text,
+                    (20, 135),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (200, 255, 200),
+                    2,
+                    cv2.LINE_AA,
+                )
+            draw_box_detections(display_frame, latest_hand_detections, (80, 255, 80))
             relation_y = 165
             for relation in select_top_relations(latest_relations):
                 cv2.putText(
@@ -854,10 +913,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-objects", type=int, default=3)
     parser.add_argument("--box-threshold", type=float, default=0.35)
     parser.add_argument("--text-threshold", type=float, default=0.25)
-    parser.add_argument("--target-box-threshold", type=float, default=0.30)
-    parser.add_argument("--target-text-threshold", type=float, default=0.25)
-    parser.add_argument("--fallback-target-box-threshold", type=float, default=0.22)
-    parser.add_argument("--fallback-target-text-threshold", type=float, default=0.18)
+    parser.add_argument("--target-box-threshold", type=float, default=0.36)
+    parser.add_argument("--target-text-threshold", type=float, default=0.30)
     parser.add_argument(
         "--disable-depth",
         action="store_false",
@@ -889,6 +946,18 @@ if __name__ == "__main__":
     parser.add_argument("--support-redetect-every", type=int, default=75)
     parser.add_argument("--anchor-cache-ttl", type=int, default=60)
     parser.add_argument("--support-cache-ttl", type=int, default=90)
+    parser.add_argument(
+        "--disable-hand-detection",
+        action="store_false",
+        dest="enable_hand_detection",
+        help="Disable hand detections and hand-relative relations.",
+    )
+    parser.set_defaults(enable_hand_detection=False)
+    parser.add_argument("--hand-query", type=str, default=DEFAULT_HAND_QUERY)
+    parser.add_argument("--hand-redetect-every", type=int, default=10)
+    parser.add_argument("--hand-cache-ttl", type=int, default=25)
+    parser.add_argument("--hand-box-threshold", type=float, default=0.25)
+    parser.add_argument("--hand-text-threshold", type=float, default=0.20)
     parser.add_argument("--query", type=str, default="I am trying to find phones")
     # parser.add_argument(
     #     "--query", type=str, default="I cannot see well since i hv myopia. help"
@@ -911,8 +980,6 @@ if __name__ == "__main__":
             text_threshold=args.text_threshold,
             target_box_threshold=args.target_box_threshold,
             target_text_threshold=args.target_text_threshold,
-            fallback_target_box_threshold=args.fallback_target_box_threshold,
-            fallback_target_text_threshold=args.fallback_target_text_threshold,
             query=args.query,
             enable_depth=args.enable_depth,
             depth_encoder=args.depth_encoder,
@@ -929,5 +996,11 @@ if __name__ == "__main__":
             support_redetect_every=args.support_redetect_every,
             anchor_cache_ttl=args.anchor_cache_ttl,
             support_cache_ttl=args.support_cache_ttl,
+            enable_hand_detection=args.enable_hand_detection,
+            hand_query=args.hand_query,
+            hand_redetect_every=args.hand_redetect_every,
+            hand_cache_ttl=args.hand_cache_ttl,
+            hand_box_threshold=args.hand_box_threshold,
+            hand_text_threshold=args.hand_text_threshold,
         )
     )

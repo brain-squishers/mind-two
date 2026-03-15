@@ -96,6 +96,178 @@ def compute_box_depth(depth_map, box, max_depth=None):
     return float(np.median(values))
 
 
+def compute_box_depth_stats(depth_map, box, max_depth=None):
+    x1, y1, x2, y2 = box.astype(int)
+    h, w = depth_map.shape[:2]
+
+    x1 = max(0, min(x1, w - 1))
+    x2 = max(0, min(x2, w))
+    y1 = max(0, min(y1, h - 1))
+    y2 = max(0, min(y2, h))
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    values = depth_map[y1:y2, x1:x2].reshape(-1)
+    values = values[np.isfinite(values)]
+    values = values[values > 0]
+    if max_depth is not None:
+        values = values[values < max_depth]
+    if values.size == 0:
+        return None
+
+    return {
+        "median_m": float(np.median(values)),
+        "std_m": float(np.std(values)),
+        "p25_m": float(np.percentile(values, 25)),
+        "p75_m": float(np.percentile(values, 75)),
+        "count": int(values.size),
+    }
+
+
+def estimate_camera_intrinsics(frame_shape, focal_ratio=1.2):
+    h, w = frame_shape[:2]
+    return {
+        "fx": focal_ratio * float(w),
+        "fy": focal_ratio * float(h),
+        "cx": 0.5 * float(w),
+        "cy": 0.5 * float(h),
+    }
+
+
+def project_pixel_to_3d(u, v, z_m, intrinsics):
+    fx = intrinsics["fx"]
+    fy = intrinsics["fy"]
+    cx = intrinsics["cx"]
+    cy = intrinsics["cy"]
+
+    x_m = (float(u) - cx) / fx * float(z_m)
+    y_m = (float(v) - cy) / fy * float(z_m)
+    return (float(x_m), float(y_m), float(z_m))
+
+
+def build_target_spatial_entry(obj_id, label, target_box, target_depth_stats, intrinsics):
+    if obj_id not in target_depth_stats:
+        return None
+
+    u, v = box_center_xy(target_box)
+    depth_stats = target_depth_stats[obj_id]
+    position_3d_m = project_pixel_to_3d(
+        u,
+        v,
+        depth_stats["median_m"],
+        intrinsics,
+    )
+
+    return {
+        "label": label,
+        "source": "target",
+        "image_center_px": (float(u), float(v)),
+        "position_3d_m": position_3d_m,
+        "depth_median_m": depth_stats["median_m"],
+        "depth_std_m": depth_stats.get("std_m"),
+        "depth_p25_m": depth_stats.get("p25_m"),
+        "depth_p75_m": depth_stats.get("p75_m"),
+        "confidence": 1.0,
+    }
+
+
+def build_detection_spatial_entry(
+    label,
+    source,
+    box,
+    score,
+    depth_map,
+    intrinsics,
+    max_depth=None,
+):
+    if depth_map is None:
+        return None
+
+    depth_stats = compute_box_depth_stats(
+        depth_map,
+        box,
+        max_depth=max_depth,
+    )
+    if depth_stats is None:
+        return None
+
+    u, v = box_center_xy(box)
+    position_3d_m = project_pixel_to_3d(
+        u,
+        v,
+        depth_stats["median_m"],
+        intrinsics,
+    )
+
+    return {
+        "label": label,
+        "source": source,
+        "image_center_px": (float(u), float(v)),
+        "position_3d_m": position_3d_m,
+        "depth_median_m": depth_stats["median_m"],
+        "depth_std_m": depth_stats["std_m"],
+        "depth_p25_m": depth_stats["p25_m"],
+        "depth_p75_m": depth_stats["p75_m"],
+        "confidence": float(score),
+    }
+
+
+def build_spatial_index(
+    frame_shape,
+    target_label,
+    target_boxes,
+    target_depth_stats,
+    anchor_detections,
+    support_detections,
+    depth_map=None,
+    max_depth=None,
+    intrinsics=None,
+):
+    if intrinsics is None:
+        intrinsics = estimate_camera_intrinsics(frame_shape)
+
+    spatial_index = {}
+
+    for obj_id, target_box in enumerate(target_boxes, start=1):
+        entry = build_target_spatial_entry(
+            obj_id,
+            target_label,
+            target_box,
+            target_depth_stats,
+            intrinsics,
+        )
+        if entry is not None:
+            spatial_index[f"target_{obj_id}"] = entry
+
+    for i, detection in enumerate(anchor_detections, start=1):
+        entry = build_detection_spatial_entry(
+            detection["label"],
+            "anchor",
+            detection["box"],
+            detection["score"],
+            depth_map,
+            intrinsics,
+            max_depth=max_depth,
+        )
+        if entry is not None:
+            spatial_index[f"anchor_{i}"] = entry
+
+    for i, detection in enumerate(support_detections, start=1):
+        entry = build_detection_spatial_entry(
+            detection["label"],
+            "support",
+            detection["box"],
+            detection["score"],
+            depth_map,
+            intrinsics,
+            max_depth=max_depth,
+        )
+        if entry is not None:
+            spatial_index[f"support_{i}"] = entry
+
+    return spatial_index
+
+
 def compute_depth_relation(target_depth_m, other_depth_m, depth_margin_m=0.25):
     if target_depth_m is None or other_depth_m is None:
         return None
@@ -213,6 +385,85 @@ def compute_ego_relations(frame_shape, target_label, target_box, target_depth_m=
     ]
 
 
+def compute_hand_relations(
+    frame_shape,
+    target_label,
+    target_box,
+    target_depth_m,
+    hand_detections,
+    depth_map=None,
+    max_depth=None,
+):
+    relations = []
+
+    for detection in hand_detections:
+        hand_box = detection["box"]
+        offsets = compute_relative_offsets(target_box, hand_box, frame_shape)
+
+        hand_depth_m = None
+        if depth_map is not None:
+            hand_depth_m = compute_box_depth(
+                depth_map,
+                hand_box,
+                max_depth=max_depth,
+            )
+
+        depth_info = compute_depth_relation(target_depth_m, hand_depth_m)
+        near_score = compute_near_score(
+            offsets,
+            None if depth_info is None else depth_info["delta_m"],
+        )
+
+        if abs(offsets["dy_norm"]) >= 0.08 and abs(offsets["dx_norm"]) <= 0.30:
+            if offsets["dy_px"] > 0:
+                relations.append(
+                    {
+                        "type": "below_hand",
+                        "subject": target_label,
+                        "object": detection["label"],
+                        "score": max(0.0, 1.0 - abs(offsets["dy_norm"]) / 0.4),
+                        "metrics": offsets,
+                    }
+                )
+
+        if depth_info is not None and depth_info["relation"] is not None:
+            hand_depth_relation = (
+                "behind_hand"
+                if depth_info["relation"] == "behind"
+                else "in_front_of_hand"
+            )
+            relations.append(
+                {
+                    "type": hand_depth_relation,
+                    "subject": target_label,
+                    "object": detection["label"],
+                    "score": max(0.0, 1.0 - depth_info["abs_delta_m"] / 1.0),
+                    "metrics": {
+                        **offsets,
+                        "depth_delta_m": depth_info["delta_m"],
+                    },
+                }
+            )
+
+        if near_score >= 0.45:
+            relations.append(
+                {
+                    "type": "near_hand",
+                    "subject": target_label,
+                    "object": detection["label"],
+                    "score": near_score,
+                    "metrics": {
+                        **offsets,
+                        "target_depth_m": target_depth_m,
+                        "hand_depth_m": hand_depth_m,
+                        "depth_delta_m": None if depth_info is None else depth_info["delta_m"],
+                    },
+                }
+            )
+
+    return relations
+
+
 def compute_target_relations(
     frame_shape,
     target_label,
@@ -220,6 +471,7 @@ def compute_target_relations(
     target_depth_stats,
     anchor_detections,
     support_detections,
+    hand_detections,
     depth_map=None,
     max_depth=None,
 ):
@@ -233,6 +485,18 @@ def compute_target_relations(
         target_label,
         target_box,
         target_depth_m=target_depth_m,
+    )
+    best_close_relation = None
+    relations.extend(
+        compute_hand_relations(
+            frame_shape,
+            target_label,
+            target_box,
+            target_depth_m,
+            hand_detections,
+            depth_map=depth_map,
+            max_depth=max_depth,
+        )
     )
 
     for detection in anchor_detections:
@@ -282,20 +546,27 @@ def compute_target_relations(
             )
 
         if near_score >= 0.45:
-            relations.append(
-                {
-                    "type": "near",
-                    "subject": target_label,
-                    "object": detection["label"],
-                    "score": near_score,
-                    "metrics": {
-                        **offsets,
-                        "other_depth_m": other_depth_m,
-                        "target_depth_m": target_depth_m,
-                        "depth_delta_m": None if depth_info is None else depth_info["delta_m"],
-                    },
+            near_relation = {
+                "type": "near",
+                "subject": target_label,
+                "object": detection["label"],
+                "score": near_score,
+                "metrics": {
+                    **offsets,
+                    "other_depth_m": other_depth_m,
+                    "target_depth_m": target_depth_m,
+                    "depth_delta_m": None if depth_info is None else depth_info["delta_m"],
+                },
+            }
+            relations.append(near_relation)
+            if (
+                best_close_relation is None
+                or near_relation["score"] > best_close_relation["score"]
+            ):
+                best_close_relation = {
+                    **near_relation,
+                    "type": "close_to",
                 }
-            )
 
     for detection in support_detections:
         support_box = detection["box"]
@@ -326,6 +597,9 @@ def compute_target_relations(
                 }
             )
 
+    if best_close_relation is not None:
+        relations.append(best_close_relation)
+
     return relations
 
 
@@ -334,12 +608,17 @@ def select_top_relations(relations, max_relations=3):
         "on_your_left": 0,
         "on_your_right": 0,
         "straight_ahead": 0,
-        "on": 1,
-        "near": 2,
-        "left_of": 3,
-        "right_of": 3,
-        "in_front_of": 4,
-        "behind": 4,
+        "near_hand": 1,
+        "below_hand": 1,
+        "behind_hand": 1,
+        "in_front_of_hand": 1,
+        "on": 2,
+        "close_to": 3,
+        "near": 4,
+        "left_of": 5,
+        "right_of": 5,
+        "in_front_of": 6,
+        "behind": 6,
     }
     return sorted(
         relations,
