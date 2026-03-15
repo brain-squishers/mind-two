@@ -11,6 +11,7 @@ import torch
 from PIL import Image
 from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
+from depth_anything.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
 from llm.gpt4o_modeling import GPT4o
 from llm.qwen2_modeling import Qwen2
 from sam2.build_sam import build_sam2_camera_predictor
@@ -25,6 +26,16 @@ if torch.cuda.is_available():
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("device", device)
+
+DEPTH_MODEL_CONFIGS = {
+    "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
+    "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
+    "vitl": {
+        "encoder": "vitl",
+        "features": 256,
+        "out_channels": [256, 512, 1024, 1024],
+    },
+}
 
 
 async def extract(query, model):
@@ -59,6 +70,77 @@ def load_model(model):
         raise NotImplementedError("INVALID MODEL NAME")
 
     return grounding_processor, grounding_model, predictor, llm
+
+
+def get_depth_checkpoint_path(depth_dataset, depth_encoder):
+    return (
+        "depth_anything_checkpoints/"
+        f"depth_anything_v2_metric_{depth_dataset}_{depth_encoder}.pth"
+    )
+
+
+def load_depth_model(
+    depth_encoder,
+    depth_dataset,
+    depth_max_depth,
+    depth_checkpoint=None,
+):
+    checkpoint_path = depth_checkpoint or get_depth_checkpoint_path(
+        depth_dataset, depth_encoder
+    )
+    depth_model = DepthAnythingV2(
+        **{
+            **DEPTH_MODEL_CONFIGS[depth_encoder],
+            "max_depth": depth_max_depth,
+        }
+    )
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    depth_model.load_state_dict(state_dict)
+    depth_model = depth_model.to(device).eval()
+    return depth_model, checkpoint_path
+
+
+def infer_metric_depth(depth_model, frame, input_size):
+    with torch.inference_mode():
+        if device == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                depth = depth_model.infer_image(frame, input_size)
+        else:
+            depth = depth_model.infer_image(frame, input_size)
+    return depth
+
+
+def compute_mask_depth_stats(
+    depth_map,
+    mask,
+    min_mask_pixels=300,
+    erode_kernel=None,
+    max_depth=None,
+):
+    mask_uint8 = mask.astype(np.uint8)
+    if erode_kernel is not None:
+        mask_uint8 = cv2.erode(mask_uint8, erode_kernel, iterations=1)
+
+    valid_mask_pixels = int(np.count_nonzero(mask_uint8))
+    if valid_mask_pixels < min_mask_pixels:
+        return None
+
+    depth_values = depth_map[mask_uint8 > 0]
+    depth_values = depth_values[np.isfinite(depth_values)]
+    depth_values = depth_values[depth_values > 0]
+
+    if max_depth is not None:
+        depth_values = depth_values[depth_values < max_depth]
+
+    if depth_values.size == 0:
+        return None
+
+    return {
+        "median_m": float(np.median(depth_values)),
+        "p25_m": float(np.percentile(depth_values, 25)),
+        "p75_m": float(np.percentile(depth_values, 75)),
+        "count": int(depth_values.size),
+    }
 
 
 class LatestFrameCapture:
@@ -247,8 +329,27 @@ async def main(
     box_threshold=0.35,
     text_threshold=0.25,
     query="I am trying to find my glass",
+    enable_depth=True,
+    depth_encoder="vits",
+    depth_dataset="hypersim",
+    depth_max_depth=20.0,
+    depth_checkpoint=None,
+    depth_every=5,
+    depth_input_size=518,
+    depth_min_mask_pixels=300,
+    depth_mask_erode_kernel=5,
 ):
     grounding_processor, grounding_model, predictor, llm = load_model(model)
+    depth_model = None
+    if enable_depth:
+        depth_model, depth_checkpoint_path = load_depth_model(
+            depth_encoder=depth_encoder,
+            depth_dataset=depth_dataset,
+            depth_max_depth=depth_max_depth,
+            depth_checkpoint=depth_checkpoint,
+        )
+        print(f"depth checkpoint {depth_checkpoint_path}")
+
     capture = LatestFrameCapture(camera_index).start()
     grounding_worker = GroundingWorker(
         grounding_processor,
@@ -270,6 +371,14 @@ async def main(
     fps_tracker = FpsTracker()
     pending_detection_request = None
     force_redetect = True
+    latest_depth_map = None
+    latest_depth_frame_idx = -1
+    latest_depth_stats = {}
+    depth_kernel = None
+    if depth_mask_erode_kernel > 1:
+        depth_kernel = np.ones(
+            (depth_mask_erode_kernel, depth_mask_erode_kernel), dtype=np.uint8
+        )
 
     try:
         while True:
@@ -326,6 +435,9 @@ async def main(
                 tracking_steps = 0
                 pending_detection_request = None
                 force_redetect = True
+                latest_depth_map = None
+                latest_depth_frame_idx = -1
+                latest_depth_stats = {}
 
             should_process = frame_count == 1 or frame_count % skip_frames == 0
 
@@ -353,6 +465,21 @@ async def main(
                             pending_detection_request = request_id
                             force_redetect = False
                 elif tracking_ready:
+                    should_run_depth = enable_depth and (
+                        latest_depth_map is None
+                        or tracking_steps == 0
+                        or (
+                            depth_every > 0 and processed_frames % depth_every == 0
+                        )
+                    )
+                    if should_run_depth:
+                        latest_depth_map = infer_metric_depth(
+                            depth_model,
+                            frame,
+                            depth_input_size,
+                        )
+                        latest_depth_frame_idx = processed_frames
+
                     tracking_steps += 1
                     should_track = tracking_steps == 1 or (
                         track_every > 0 and tracking_steps % track_every == 0
@@ -361,13 +488,30 @@ async def main(
                         out_obj_ids, out_mask_logits = predictor.track(frame)
                         width, height = frame.shape[:2][::-1]
                         all_mask = np.zeros((height, width, 1), dtype=np.uint8)
+                        current_depth_stats = {}
                         for i in range(len(out_obj_ids)):
-                            out_mask = (out_mask_logits[i] > 0.0).permute(
-                                1, 2, 0
-                            ).cpu().numpy().astype(np.uint8) * 255
+                            binary_mask = (
+                                (out_mask_logits[i] > 0.0)
+                                .squeeze(0)
+                                .cpu()
+                                .numpy()
+                                .astype(np.uint8)
+                            )
+                            out_mask = binary_mask[:, :, None] * 255
                             all_mask = cv2.bitwise_or(all_mask, out_mask)
+                            if enable_depth and latest_depth_map is not None:
+                                stats = compute_mask_depth_stats(
+                                    latest_depth_map,
+                                    binary_mask,
+                                    min_mask_pixels=depth_min_mask_pixels,
+                                    erode_kernel=depth_kernel,
+                                    max_depth=depth_max_depth,
+                                )
+                                if stats is not None:
+                                    current_depth_stats[int(out_obj_ids[i])] = stats
 
                         if len(out_obj_ids) != 0:
+                            latest_depth_stats = current_depth_stats
                             last_mask_rgb = cv2.cvtColor(all_mask, cv2.COLOR_GRAY2RGB)
                             mask_pixels = int(np.count_nonzero(all_mask))
                             mask_ratio = mask_pixels / float(width * height)
@@ -388,9 +532,11 @@ async def main(
                                 pending_detection_request = None
                                 force_redetect = True
                                 tracking_steps = 0
+                                latest_depth_stats = {}
                                 print("tracking lost; returning to detection")
                         else:
                             last_mask_rgb = None
+                            latest_depth_stats = {}
                             low_mask_count += 1
                             print("track produced no object ids; cache cleared")
                             if low_mask_count >= lost_patience:
@@ -399,6 +545,7 @@ async def main(
                                 pending_detection_request = None
                                 force_redetect = True
                                 tracking_steps = 0
+                                latest_depth_stats = {}
                                 print("tracking lost; returning to detection")
 
             if last_mask_rgb is not None:
@@ -429,6 +576,36 @@ async def main(
                 2,
                 cv2.LINE_AA,
             )
+            if enable_depth:
+                depth_status = (
+                    f"DEPTH {latest_depth_frame_idx}"
+                    if latest_depth_map is not None
+                    else "DEPTH waiting"
+                )
+                cv2.putText(
+                    display_frame,
+                    depth_status,
+                    (20, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 200, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+                y = 135
+                for obj_id in sorted(latest_depth_stats):
+                    median_m = latest_depth_stats[obj_id]["median_m"]
+                    cv2.putText(
+                        display_frame,
+                        f"obj {obj_id}: {median_m:.2f} m",
+                        (20, y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.65,
+                        (255, 200, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    y += 28
 
             cv2.imshow("run_live", display_frame)
             key = cv2.waitKey(1) & 0xFF
@@ -456,6 +633,31 @@ if __name__ == "__main__":
     parser.add_argument("--max-objects", type=int, default=3)
     parser.add_argument("--box-threshold", type=float, default=0.35)
     parser.add_argument("--text-threshold", type=float, default=0.6)
+    parser.add_argument(
+        "--disable-depth",
+        action="store_false",
+        dest="enable_depth",
+        help="Disable metric depth estimation in the live pipeline.",
+    )
+    parser.set_defaults(enable_depth=True)
+    parser.add_argument(
+        "--depth-encoder",
+        type=str,
+        default="vits",
+        choices=["vits", "vitb", "vitl"],
+    )
+    parser.add_argument(
+        "--depth-dataset",
+        type=str,
+        default="hypersim",
+        choices=["hypersim", "vkitti"],
+    )
+    parser.add_argument("--depth-max-depth", type=float, default=20.0)
+    parser.add_argument("--depth-checkpoint", type=str, default=None)
+    parser.add_argument("--depth-every", type=int, default=5)
+    parser.add_argument("--depth-input-size", type=int, default=518)
+    parser.add_argument("--depth-min-mask-pixels", type=int, default=300)
+    parser.add_argument("--depth-mask-erode-kernel", type=int, default=5)
     # parser.add_argument("--query", type=str, default="I am trying to find my glass")
     parser.add_argument("--query", type=str, default="I am trying to find phones")
     args = parser.parse_args()
@@ -474,5 +676,14 @@ if __name__ == "__main__":
             box_threshold=args.box_threshold,
             text_threshold=args.text_threshold,
             query=args.query,
+            enable_depth=args.enable_depth,
+            depth_encoder=args.depth_encoder,
+            depth_dataset=args.depth_dataset,
+            depth_max_depth=args.depth_max_depth,
+            depth_checkpoint=args.depth_checkpoint,
+            depth_every=args.depth_every,
+            depth_input_size=args.depth_input_size,
+            depth_min_mask_pixels=args.depth_min_mask_pixels,
+            depth_mask_erode_kernel=args.depth_mask_erode_kernel,
         )
     )

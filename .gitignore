@@ -12,6 +12,8 @@ checkpoints/*.pt
 gdino_checkpoints/*.pth
 gdino_checkpoints/grounding-dino*
 llm_checkpoints/Qwen2*
+depth_anything_checkpoints/*.pth
 
 *.gif
 *.mp4
+*/assets/*
