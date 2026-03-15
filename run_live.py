@@ -114,7 +114,14 @@ class FpsTracker:
         return self.fps
 
 
-def run_grounding(grounding_processor, grounding_model, frame, text):
+def run_grounding(
+    grounding_processor,
+    grounding_model,
+    frame,
+    text,
+    box_threshold=0.35,
+    text_threshold=0.25,
+):
     inputs = grounding_processor(
         images=Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)),
         text=text,
@@ -131,17 +138,25 @@ def run_grounding(grounding_processor, grounding_model, frame, text):
     results = grounding_processor.post_process_grounded_object_detection(
         outputs,
         inputs.input_ids,
-        threshold=0.6,
-        text_threshold=0.6,
+        threshold=box_threshold,
+        text_threshold=text_threshold,
         target_sizes=[frame.shape[:2]],
     )
-    return results[0]["boxes"]
+    return results[0]
 
 
 class GroundingWorker:
-    def __init__(self, grounding_processor, grounding_model):
+    def __init__(
+        self,
+        grounding_processor,
+        grounding_model,
+        box_threshold=0.35,
+        text_threshold=0.25,
+    ):
         self.grounding_processor = grounding_processor
         self.grounding_model = grounding_model
+        self.box_threshold = box_threshold
+        self.text_threshold = text_threshold
         self.lock = threading.Lock()
         self.pending_job = None
         self.latest_result = None
@@ -184,16 +199,18 @@ class GroundingWorker:
                 continue
 
             try:
-                boxes = run_grounding(
+                result = run_grounding(
                     self.grounding_processor,
                     self.grounding_model,
                     job["frame"],
                     job["text"],
+                    box_threshold=self.box_threshold,
+                    text_threshold=self.text_threshold,
                 )
             except Exception as e:
                 with self.lock:
                     self.latest_result = {
-                        "boxes": None,
+                        "result": None,
                         "frame": job["frame"],
                         "text": job["text"],
                         "request_id": job["request_id"],
@@ -204,7 +221,7 @@ class GroundingWorker:
 
             with self.lock:
                 self.latest_result = {
-                    "boxes": boxes,
+                    "result": result,
                     "frame": job["frame"],
                     "text": job["text"],
                     "request_id": job["request_id"],
@@ -226,11 +243,19 @@ async def main(
     redetect_every=30,
     lost_mask_ratio=0.001,
     lost_patience=5,
+    max_objects=3,
+    box_threshold=0.35,
+    text_threshold=0.25,
     query="I am trying to find my glass",
 ):
     grounding_processor, grounding_model, predictor, llm = load_model(model)
     capture = LatestFrameCapture(camera_index).start()
-    grounding_worker = GroundingWorker(grounding_processor, grounding_model).start()
+    grounding_worker = GroundingWorker(
+        grounding_processor,
+        grounding_model,
+        box_threshold=box_threshold,
+        text_threshold=text_threshold,
+    ).start()
 
     query_queue = collections.deque([query])
     response_queue = collections.deque([])
@@ -264,14 +289,24 @@ async def main(
                     force_redetect = True
                     detection_result = None
                 if detection_result is not None and detection_result["text"] == text:
-                    print(f"redetect boxes: {detection_result['boxes'].shape[0]}")
-                    if detection_result["boxes"].shape[0] != 0:
+                    result = detection_result["result"]
+                    boxes = result["boxes"]
+                    scores = result["scores"]
+                    print(f"redetect boxes: {boxes.shape[0]}")
+                    if boxes.shape[0] != 0:
+                        keep_count = min(max_objects, boxes.shape[0])
+                        if keep_count < boxes.shape[0]:
+                            top_indices = torch.argsort(scores, descending=True)[
+                                :keep_count
+                            ]
+                            boxes = boxes[top_indices]
                         predictor.load_first_frame(detection_result["frame"])
-                        predictor.add_new_points(
-                            frame_idx=0,
-                            obj_id=2,
-                            box=detection_result["boxes"],
-                        )
+                        for i, box in enumerate(boxes):
+                            predictor.add_new_points(
+                                frame_idx=0,
+                                obj_id=i + 1,
+                                box=box,
+                            )
                         tracking_ready = True
                         last_mask_rgb = None
                         low_mask_count = 0
@@ -297,9 +332,13 @@ async def main(
             if text and should_process:
                 processed_frames += 1
                 if not tracking_ready:
-                    should_redetect = force_redetect or processed_frames == 1 or (
-                        init_redetect_every > 0
-                        and processed_frames % init_redetect_every == 0
+                    should_redetect = (
+                        force_redetect
+                        or processed_frames == 1
+                        or (
+                            init_redetect_every > 0
+                            and processed_frames % init_redetect_every == 0
+                        )
                     )
                 else:
                     should_redetect = (
@@ -414,8 +453,11 @@ if __name__ == "__main__":
     parser.add_argument("--redetect-every", type=int, default=30)
     parser.add_argument("--lost-mask-ratio", type=float, default=0.001)
     parser.add_argument("--lost-patience", type=int, default=5)
+    parser.add_argument("--max-objects", type=int, default=3)
+    parser.add_argument("--box-threshold", type=float, default=0.35)
+    parser.add_argument("--text-threshold", type=float, default=0.6)
     # parser.add_argument("--query", type=str, default="I am trying to find my glass")
-    parser.add_argument("--query", type=str, default="Where is my can of juice?")
+    parser.add_argument("--query", type=str, default="I am trying to find phones")
     args = parser.parse_args()
 
     asyncio.run(
@@ -428,6 +470,9 @@ if __name__ == "__main__":
             redetect_every=args.redetect_every,
             lost_mask_ratio=args.lost_mask_ratio,
             lost_patience=args.lost_patience,
+            max_objects=args.max_objects,
+            box_threshold=args.box_threshold,
+            text_threshold=args.text_threshold,
             query=args.query,
         )
     )
