@@ -1,7 +1,9 @@
 import argparse
 import asyncio
 import collections
+import json
 import re
+import time
 
 import cv2
 import numpy as np
@@ -17,7 +19,9 @@ from live_runtime import (
     extract_handler,
     load_depth_model,
     load_model,
+    spatial_response_handler,
 )
+from scene_output import build_scene_output_payload
 from spatial_reasoning import (
     build_spatial_index,
     compute_iou_xyxy,
@@ -251,6 +255,7 @@ async def main(
 
     query_queue = collections.deque([query])
     response_queue = collections.deque([])
+    spatial_response_queue = collections.deque([])
 
     current_query = query
     current_query_summary = query
@@ -282,6 +287,12 @@ async def main(
     latest_hand_detections = []
     latest_relations = []
     latest_spatial_index = {}
+    latest_scene_payload = None
+    latest_spatial_response = ""
+    pending_spatial_response = False
+    last_scene_payload_key = None
+    last_spatial_response_time = 0.0
+    spatial_response_cooldown_s = 2.5
     latest_anchor_frame_idx = -1
     latest_support_frame_idx = -1
     latest_hand_frame_idx = -1
@@ -434,6 +445,11 @@ async def main(
                 pending_query = query_queue.popleft()
                 asyncio.create_task(extract_handler(pending_query, response_queue, llm))
 
+            if spatial_response_queue:
+                latest_spatial_response = spatial_response_queue.popleft()
+                pending_spatial_response = False
+                print("spatial response:", latest_spatial_response)
+
             if response_queue:
                 extraction = response_queue.popleft()
                 target_queries = extraction["targets"]
@@ -484,6 +500,11 @@ async def main(
                 latest_hand_detections = []
                 latest_relations = []
                 latest_spatial_index = {}
+                latest_scene_payload = None
+                latest_spatial_response = ""
+                pending_spatial_response = False
+                last_scene_payload_key = None
+                last_spatial_response_time = 0.0
                 latest_anchor_frame_idx = -1
                 latest_support_frame_idx = -1
                 latest_hand_frame_idx = -1
@@ -643,6 +664,11 @@ async def main(
                                 latest_target_boxes = []
                                 latest_relations = []
                                 latest_spatial_index = {}
+                                latest_scene_payload = None
+                                latest_spatial_response = ""
+                                pending_spatial_response = False
+                                last_scene_payload_key = None
+                                last_spatial_response_time = 0.0
                                 latest_anchor_detections = []
                                 latest_support_detections = []
                                 latest_hand_detections = []
@@ -659,6 +685,11 @@ async def main(
                             latest_target_boxes = []
                             latest_relations = []
                             latest_spatial_index = {}
+                            latest_scene_payload = None
+                            latest_spatial_response = ""
+                            pending_spatial_response = False
+                            last_scene_payload_key = None
+                            last_spatial_response_time = 0.0
                             latest_anchor_detections = []
                             latest_support_detections = []
                             latest_hand_detections = []
@@ -682,6 +713,11 @@ async def main(
                                 latest_target_boxes = []
                                 latest_relations = []
                                 latest_spatial_index = {}
+                                latest_scene_payload = None
+                                latest_spatial_response = ""
+                                pending_spatial_response = False
+                                last_scene_payload_key = None
+                                last_spatial_response_time = 0.0
                                 latest_anchor_detections = []
                                 latest_support_detections = []
                                 latest_hand_detections = []
@@ -774,6 +810,55 @@ async def main(
                     depth_map=latest_depth_map,
                     max_depth=depth_max_depth,
                 )
+                latest_scene_payload = build_scene_output_payload(
+                    current_query,
+                    current_label,
+                    latest_spatial_index,
+                    select_top_relations(latest_relations),
+                )
+                scene_payload_key = None
+                if latest_scene_payload is not None:
+                    scene_payload_key = json.dumps(
+                        latest_scene_payload,
+                        sort_keys=True,
+                        ensure_ascii=True,
+                    )
+                now_s = time.time()
+                payload_changed = (
+                    scene_payload_key is not None
+                    and scene_payload_key != last_scene_payload_key
+                )
+                cooldown_ready = (
+                    now_s - last_spatial_response_time >= spatial_response_cooldown_s
+                )
+                should_generate_spatial_response = (
+                    tracking_ready
+                    and latest_scene_payload is not None
+                    and not pending_spatial_response
+                    and payload_changed
+                    and cooldown_ready
+                )
+                if should_generate_spatial_response:
+                    pending_spatial_response = True
+                    last_scene_payload_key = scene_payload_key
+                    last_spatial_response_time = now_s
+                    print(
+                        "sending spatial response request:",
+                        {
+                            "ego_relation": latest_scene_payload.get("ego_relation"),
+                            "relations": latest_scene_payload.get("relations"),
+                            "target_depth_m": latest_scene_payload.get(
+                                "target_depth_m"
+                            ),
+                        },
+                    )
+                    asyncio.create_task(
+                        spatial_response_handler(
+                            latest_scene_payload,
+                            spatial_response_queue,
+                            llm,
+                        )
+                    )
 
             if last_mask_rgb is not None:
                 display_frame = cv2.addWeighted(display_frame, 1, last_mask_rgb, 0.5, 0)
@@ -884,6 +969,17 @@ async def main(
                     cv2.LINE_AA,
                 )
                 relation_y += 26
+            if latest_spatial_response:
+                cv2.putText(
+                    display_frame,
+                    latest_spatial_response,
+                    (20, 260),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
 
             cv2.imshow("run_live", display_frame)
             key = cv2.waitKey(1) & 0xFF

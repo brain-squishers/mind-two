@@ -1,4 +1,5 @@
 import ast
+import json
 import threading
 import time
 
@@ -98,6 +99,21 @@ async def extract(query, model):
 async def extract_handler(query, queue, model):
     extraction = await extract(query, model)
     queue.append(extraction)
+
+
+async def generate_spatial_response(payload, model):
+    with open("llm/spatial_output.txt", "r") as file:
+        prompt = file.read()
+    rendered_prompt = prompt.format_map(
+        {"payload": json.dumps(payload, ensure_ascii=True)}
+    )
+    response = await model.generate(rendered_prompt)
+    return response.strip()
+
+
+async def spatial_response_handler(payload, queue, model):
+    response = await generate_spatial_response(payload, model)
+    queue.append(response)
 
 
 def load_model(model):
