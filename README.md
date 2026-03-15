@@ -25,11 +25,15 @@ Grounded SAM 2 for streaming video tracking using natural language queries.
 </div>
 
 
-This system is comprised of three components:
+This system is comprised of three core components:
 
 - **LLM**: This module is responsible for parsing the input query or inferring the intended object.
 - **GroundingDINO**: This component handles object referencing.
 - **SAM-2**: This part specializes in object tracking.
+
+The current live pipeline also supports:
+
+- **Depth Anything V2 Metric**: Estimates object distance in meters from the full frame, then reads depth inside the tracked SAM mask.
 
 ## Getting Started
 
@@ -91,23 +95,46 @@ cd gdino_checkpoints
 hf download IDEA-Research/grounding-dino-tiny --local-dir grounding-dino-tiny
 ```
 
-4. Download LLM
+4. Download Depth Anything checkpoints
 
-4.1 GPT4-o (recommend)
+Non-metric:
+
+```bash
+cd depth_anything_checkpoints
+./download_nonmetric_ckpts.sh
+```
+
+Metric indoor checkpoints for the live pipeline:
+
+```bash
+cd depth_anything_checkpoints
+./download_metric_indoor_ckpts.sh
+```
+
+Metric outdoor checkpoints:
+
+```bash
+cd depth_anything_checkpoints
+./download_metric_outdoor_ckpts.sh
+```
+
+5. Download LLM
+
+5.1 GPT4-o (recommend)
 
 ```bash
 cd llm
 touch .env
 ```
 
-past your API_KEY or API_BASE (Azure only)
+Paste your API key or API base (Azure only):
 
 ```
 API_KEY="xxx"
 API_BASE = "xxx"
 ```
 
-4.2 Qwen2
+5.2 Qwen2
 
 ```bash
 cd llm_checkpoints
@@ -116,7 +143,39 @@ hf download Qwen/Qwen2-7B-Instruct-AWQ --local-dir Qwen2-7B-Instruct-AWQ
 install the corresponding packages
 
 
-### run demo
+### Run Live Webcam
+
+This is the main real-time entrypoint.
+
+Default behavior:
+
+- webcam capture from camera `0`
+- LLM query rewriting
+- Grounding DINO initialization and periodic re-detection
+- SAM2 tracking
+- metric indoor depth estimation with cached distance overlay
+
+Run it:
+
+```bash
+python run_live.py
+```
+
+Useful options:
+
+```bash
+python run_live.py --query "I am trying to find my phone"
+python run_live.py --camera-index 1
+python run_live.py --disable-depth
+python run_live.py --depth-dataset vkitti --depth-max-depth 80
+```
+
+Depth overlay appears in the OpenCV window as:
+
+- `DEPTH cached <frame>`
+- `obj <id>: <distance> m`
+
+### Run Demo
 
 Step-1: Check available camera
 ```bash
