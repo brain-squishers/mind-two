@@ -6,6 +6,9 @@ class QueryInput(ABC):
     def poll_query(self) -> str | None:
         raise NotImplementedError
 
+    def release(self) -> None:
+        return None
+
 
 class StaticQueryInput(QueryInput):
     def __init__(self, query: str):
@@ -17,4 +20,3 @@ class StaticQueryInput(QueryInput):
             return None
         self._consumed = True
         return self._query
-

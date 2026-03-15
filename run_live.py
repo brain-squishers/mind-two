@@ -4,7 +4,7 @@ import asyncio
 import cv2
 
 from live.bootstrap import build_runtime_dependencies, release_runtime_dependencies
-from live.config import DEFAULT_HAND_QUERY, LiveConfig
+from live.config import DEFAULT_FIXED_ANCHORS, DEFAULT_HAND_QUERY, LiveConfig
 from live.context_pipeline import (
     apply_context_detection_result,
     expire_context_cache,
@@ -52,9 +52,15 @@ def get_ego_relation(relations):
 
 async def main(config: LiveConfig):
     deps = build_runtime_dependencies(config)
-    state = build_initial_runtime_state(config.query)
+    initial_query = (
+        f"Listening for '{config.wake_phrase}'"
+        if config.query_input == "audio"
+        else config.query
+    )
+    state = build_initial_runtime_state(initial_query)
     fps_tracker = FpsTracker()
     depth_kernel = build_depth_kernel(config)
+    last_frame_source_state = None
     scene_memory = SceneMemory(
         retention_seconds=config.scene_memory_retention_seconds,
         merge_time_window_s=config.scene_memory_merge_time_window_s,
@@ -68,8 +74,18 @@ async def main(config: LiveConfig):
 
             frame = deps.frame_source.read_latest()
             if frame is None:
+                source_status = deps.frame_source.get_status()
+                source_state = (
+                    source_status.get("source"),
+                    source_status.get("state"),
+                    source_status.get("ready"),
+                )
+                if source_state != last_frame_source_state:
+                    print("frame source status:", source_status)
+                    last_frame_source_state = source_state
                 await asyncio.sleep(0.005)
                 continue
+            last_frame_source_state = None
 
             state.frame_count += 1
             poll_depth_result(deps.depth_worker, state.depth)
@@ -87,7 +103,7 @@ async def main(config: LiveConfig):
             schedule_query_extraction(state, deps.llm, extract_handler)
             poll_spatial_response(state, deps.output_sink)
 
-            extraction = apply_extraction_result(state)
+            extraction = apply_extraction_result(state, config)
             if extraction is not None:
                 print("extraction:", extraction)
 
@@ -156,7 +172,26 @@ async def main(config: LiveConfig):
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="Low-latency live webcam runner.")
     parser.add_argument("--model", type=str, default="gpt-4o-2024-05-13")
+    parser.add_argument(
+        "--query-input",
+        type=str,
+        default="text",
+        choices=["text", "audio"],
+    )
+    parser.add_argument(
+        "--frame-source",
+        type=str,
+        default="webcam",
+        choices=["webcam", "server"],
+    )
     parser.add_argument("--camera-index", type=int, default=0)
+    parser.add_argument(
+        "--stream-url",
+        type=str,
+        default="http://127.0.0.1:5000/stream/latest-frame",
+    )
+    parser.add_argument("--stream-poll-interval-s", type=float, default=0.03)
+    parser.add_argument("--stream-timeout-s", type=float, default=2.0)
     parser.add_argument("--skip-frames", type=int, default=2)
     parser.add_argument("--track-every", type=int, default=3)
     parser.add_argument("--init-redetect-every", type=int, default=10)
@@ -166,8 +201,8 @@ def build_arg_parser():
     parser.add_argument("--max-objects", type=int, default=3)
     parser.add_argument("--box-threshold", type=float, default=0.35)
     parser.add_argument("--text-threshold", type=float, default=0.25)
-    parser.add_argument("--target-box-threshold", type=float, default=0.36)
-    parser.add_argument("--target-text-threshold", type=float, default=0.30)
+    parser.add_argument("--target-box-threshold", type=float, default=0.30)
+    parser.add_argument("--target-text-threshold", type=float, default=0.25)
     parser.add_argument(
         "--disable-depth",
         action="store_false",
@@ -200,6 +235,18 @@ def build_arg_parser():
     parser.add_argument("--anchor-cache-ttl", type=int, default=60)
     parser.add_argument("--support-cache-ttl", type=int, default=90)
     parser.add_argument(
+        "--anchor-source",
+        type=str,
+        default="fixed",
+        choices=["fixed", "llm"],
+    )
+    parser.add_argument(
+        "--fixed-anchors",
+        type=str,
+        default=",".join(DEFAULT_FIXED_ANCHORS),
+        help="Comma-separated anchor list used when --anchor-source fixed.",
+    )
+    parser.add_argument(
         "--disable-hand-detection",
         action="store_false",
         dest="enable_hand_detection",
@@ -212,13 +259,35 @@ def build_arg_parser():
     parser.add_argument("--hand-box-threshold", type=float, default=0.25)
     parser.add_argument("--hand-text-threshold", type=float, default=0.20)
     parser.add_argument("--query", type=str, default="I am trying to find phones")
+    parser.add_argument("--wake-phrase", type=str, default="hello")
+    parser.add_argument(
+        "--transcription-model",
+        type=str,
+        default="gpt-4o-transcribe",
+    )
+    parser.add_argument("--transcription-language", type=str, default=None)
+    parser.add_argument("--audio-input-device-index", type=int, default=None)
+    parser.add_argument("--audio-sample-rate", type=int, default=16000)
+    parser.add_argument("--audio-chunk-size", type=int, default=1024)
+    parser.add_argument("--wake-window-s", type=float, default=2.5)
+    parser.add_argument("--wake-cooldown-s", type=float, default=0.4)
+    parser.add_argument("--command-max-record-s", type=float, default=8.0)
+    parser.add_argument("--audio-silence-threshold", type=float, default=550.0)
+    parser.add_argument("--min-silence-duration-s", type=float, default=1.0)
+    parser.add_argument("--min-command-duration-s", type=float, default=0.75)
+    parser.add_argument("--audio-pre-roll-s", type=float, default=0.35)
     return parser
 
 
 def config_from_args(args):
     return LiveConfig(
         model=args.model,
+        query_input=args.query_input,
+        frame_source=args.frame_source,
         camera_index=args.camera_index,
+        stream_url=args.stream_url,
+        stream_poll_interval_s=args.stream_poll_interval_s,
+        stream_timeout_s=args.stream_timeout_s,
         skip_frames=args.skip_frames,
         track_every=args.track_every,
         init_redetect_every=args.init_redetect_every,
@@ -246,12 +315,31 @@ def config_from_args(args):
         support_redetect_every=args.support_redetect_every,
         anchor_cache_ttl=args.anchor_cache_ttl,
         support_cache_ttl=args.support_cache_ttl,
+        anchor_source=args.anchor_source,
+        fixed_anchor_queries=tuple(
+            anchor.strip()
+            for anchor in args.fixed_anchors.split(",")
+            if anchor.strip()
+        ),
         enable_hand_detection=args.enable_hand_detection,
         hand_query=args.hand_query,
         hand_redetect_every=args.hand_redetect_every,
         hand_cache_ttl=args.hand_cache_ttl,
         hand_box_threshold=args.hand_box_threshold,
         hand_text_threshold=args.hand_text_threshold,
+        wake_phrase=args.wake_phrase,
+        transcription_model=args.transcription_model,
+        transcription_language=args.transcription_language,
+        audio_input_device_index=args.audio_input_device_index,
+        audio_sample_rate=args.audio_sample_rate,
+        audio_chunk_size=args.audio_chunk_size,
+        wake_window_s=args.wake_window_s,
+        wake_cooldown_s=args.wake_cooldown_s,
+        command_max_record_s=args.command_max_record_s,
+        audio_silence_threshold=args.audio_silence_threshold,
+        min_silence_duration_s=args.min_silence_duration_s,
+        min_command_duration_s=args.min_command_duration_s,
+        audio_pre_roll_s=args.audio_pre_roll_s,
     )
 
 

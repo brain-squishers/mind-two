@@ -2,6 +2,12 @@ import asyncio
 import re
 
 
+def resolve_anchor_queries(extraction, config):
+    if config.anchor_source == "fixed":
+        return list(config.fixed_anchor_queries)
+    return extraction["anchors"]
+
+
 def format_query_label(text):
     label = re.sub(r"[\s\.,;:!?]+$", "", text.strip())
     return label or "object"
@@ -57,7 +63,7 @@ def schedule_query_extraction(state, llm, extract_handler):
     return True
 
 
-def apply_extraction_result(state):
+def apply_extraction_result(state, config):
     if not state.response_queue:
         return None
 
@@ -71,7 +77,7 @@ def apply_extraction_result(state):
 
     query_state.target_queries = extraction["targets"]
     query_state.target_query_index = 0
-    query_state.anchor_queries = extraction["anchors"]
+    query_state.anchor_queries = resolve_anchor_queries(extraction, config)
     query_state.support_surface_queries = extraction["support_surfaces"]
     query_state.active_target_query = get_active_target_query(
         query_state.target_queries,

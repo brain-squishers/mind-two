@@ -150,6 +150,36 @@ class OpenAIAPIWrapper(BaseAPIWrapper):
     
         return gpt_cv_nlp, total_tokens
 
+    def transcribe_audio(
+        self,
+        audio_path,
+        model="gpt-4o-transcribe",
+        language=None,
+        max_try=5,
+    ):
+        while max_try > 0:
+            try:
+                with open(audio_path, "rb") as audio_file:
+                    kwargs = {
+                        "model": model,
+                        "file": audio_file,
+                    }
+                    if language:
+                        kwargs["language"] = language
+                    response = self.client.audio.transcriptions.create(**kwargs)
+                if hasattr(response, "text"):
+                    return response.text or ""
+                if isinstance(response, dict):
+                    return response.get("text", "")
+                return str(response)
+            except Exception as e:
+                print(f"encounter transcription error: {e}")
+                print("fail ", max_try)
+                time.sleep(self.time_out)
+                max_try -= 1
+
+        return ""
+
     def encode_image(self, image_path):
         with open(image_path, "rb") as image_file:
             return base64.b64encode(image_file.read()).decode("utf-8")

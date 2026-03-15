@@ -34,6 +34,12 @@ REQUIRED_PACKAGES = [
     "imageio",
     "transformers>=4.33.2",
     "openai>=1.0.0",
+    "PyAudio",
+    "fastapi",
+    "pydantic",
+    "aiortc",
+    "aiohttp",
+    "uvicorn",
 ]
 
 EXTRA_PACKAGES = {
