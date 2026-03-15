@@ -21,6 +21,7 @@ from live_runtime import (
     load_model,
     spatial_response_handler,
 )
+from scene_memory import SceneMemory, format_last_seen_message
 from scene_output import build_scene_output_payload
 from spatial_reasoning import (
     build_spatial_index,
@@ -192,6 +193,13 @@ def format_relation_text(relation):
     return f"{relation['subject']} {relation_text} {relation['object']}"
 
 
+def get_ego_relation(relations):
+    for relation in relations:
+        if relation["type"] in {"on_your_left", "on_your_right", "straight_ahead"}:
+            return relation["type"]
+    return None
+
+
 async def main(
     model="gpt-4o-2024-05-13",
     camera_index=0,
@@ -289,6 +297,8 @@ async def main(
     latest_spatial_index = {}
     latest_scene_payload = None
     latest_spatial_response = ""
+    latest_memory_entry = None
+    latest_memory_response = ""
     pending_spatial_response = False
     last_scene_payload_key = None
     last_spatial_response_time = 0.0
@@ -311,6 +321,14 @@ async def main(
         depth_kernel = np.ones(
             (depth_mask_erode_kernel, depth_mask_erode_kernel), dtype=np.uint8
         )
+    scene_memory = SceneMemory(
+        retention_seconds=60.0,
+        merge_time_window_s=2.0,
+        merge_distance_m=0.5,
+        max_entries=200,
+    )
+    last_memory_write_time = 0.0
+    memory_write_cooldown_s = 1.5
 
     try:
         while True:
@@ -383,6 +401,8 @@ async def main(
                                 low_mask_count = 0
                                 tracking_steps = 0
                                 force_redetect = False
+                                latest_memory_entry = None
+                                latest_memory_response = ""
                             else:
                                 if target_query_index + 1 < len(target_queries):
                                     target_query_index += 1
@@ -502,6 +522,8 @@ async def main(
                 latest_spatial_index = {}
                 latest_scene_payload = None
                 latest_spatial_response = ""
+                latest_memory_entry = None
+                latest_memory_response = ""
                 pending_spatial_response = False
                 last_scene_payload_key = None
                 last_spatial_response_time = 0.0
@@ -675,6 +697,17 @@ async def main(
                                 latest_anchor_frame_idx = -1
                                 latest_support_frame_idx = -1
                                 latest_hand_frame_idx = -1
+                                latest_memory_entry = scene_memory.find_best_recent_by_labels(
+                                    target_queries,
+                                    now_s=time.time(),
+                                    max_age_s=30.0,
+                                )
+                                latest_memory_response = format_last_seen_message(
+                                    latest_memory_entry,
+                                    now_s=time.time(),
+                                )
+                                if latest_memory_response:
+                                    print("memory fallback:", latest_memory_response)
                                 print("tracking lost; returning to detection")
                         else:
                             last_mask_rgb = None
@@ -724,6 +757,17 @@ async def main(
                                 latest_anchor_frame_idx = -1
                                 latest_support_frame_idx = -1
                                 latest_hand_frame_idx = -1
+                                latest_memory_entry = scene_memory.find_best_recent_by_labels(
+                                    target_queries,
+                                    now_s=time.time(),
+                                    max_age_s=30.0,
+                                )
+                                latest_memory_response = format_last_seen_message(
+                                    latest_memory_entry,
+                                    now_s=time.time(),
+                                )
+                                if latest_memory_response:
+                                    print("memory fallback:", latest_memory_response)
                                 print("tracking lost; returning to detection")
 
                 can_schedule_context = (
@@ -810,6 +854,46 @@ async def main(
                     depth_map=latest_depth_map,
                     max_depth=depth_max_depth,
                 )
+                target_entry = latest_spatial_index.get("target_1")
+                now_s = time.time()
+                should_write_memory = (
+                    tracking_ready
+                    and target_entry is not None
+                    and target_entry.get("depth_std_m") is not None
+                    and latest_mask_ratio >= depth_stable_mask_ratio
+                    and stable_mask_count >= depth_stable_patience
+                    and low_mask_count == 0
+                    and now_s - last_memory_write_time >= memory_write_cooldown_s
+                )
+                if should_write_memory:
+                    top_relations = select_top_relations(latest_relations)
+                    memory_entry = scene_memory.add_observation(
+                        label=current_label,
+                        source="target",
+                        position_cam_3d_m=target_entry["position_3d_m"],
+                        depth_std_m=target_entry["depth_std_m"],
+                        ego_relation=get_ego_relation(top_relations),
+                        relations=top_relations,
+                        confidence=target_entry.get("confidence"),
+                        image_center_px=target_entry.get("image_center_px"),
+                        bbox_xyxy=tuple(latest_target_boxes[0])
+                        if latest_target_boxes
+                        else None,
+                        metadata={
+                            "target_query": active_target_query,
+                        },
+                        timestamp_s=now_s,
+                    )
+                    last_memory_write_time = now_s
+                    print(
+                        "memory write:",
+                        {
+                            "id": memory_entry.memory_id,
+                            "label": memory_entry.label,
+                            "ego_relation": memory_entry.ego_relation,
+                            "position_3d_m": memory_entry.position_cam_3d_m,
+                        },
+                    )
                 latest_scene_payload = build_scene_output_payload(
                     current_query,
                     current_label,
@@ -977,6 +1061,22 @@ async def main(
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.65,
                     (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+            if (not tracking_ready) and latest_memory_entry is not None:
+                latest_memory_response = format_last_seen_message(
+                    latest_memory_entry,
+                    now_s=time.time(),
+                )
+            if (not tracking_ready) and latest_memory_response:
+                cv2.putText(
+                    display_frame,
+                    latest_memory_response,
+                    (20, 290),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (255, 220, 180),
                     2,
                     cv2.LINE_AA,
                 )
