@@ -33,17 +33,71 @@ DEPTH_MODEL_CONFIGS = {
 }
 
 
+def _normalize_phrase(value):
+    if not isinstance(value, str):
+        return ""
+    return value.strip().strip(".").strip()
+
+
+def _normalize_phrase_list(values, max_items=None):
+    if not isinstance(values, list):
+        return []
+
+    normalized = []
+    seen = set()
+    for value in values:
+        phrase = _normalize_phrase(value)
+        if not phrase:
+            continue
+        key = phrase.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(phrase)
+        if max_items is not None and len(normalized) >= max_items:
+            break
+    return normalized
+
+
+def parse_extraction_payload(raw_text):
+    payload = ast.literal_eval(raw_text)
+    if not isinstance(payload, dict):
+        raise ValueError("LLM extraction output must be a dictionary")
+
+    targets = _normalize_phrase_list(payload.get("targets", []), max_items=3)
+    anchors = _normalize_phrase_list(payload.get("anchors", []))
+    support_surfaces = _normalize_phrase_list(payload.get("support_surfaces", []))
+
+    if not targets:
+        legacy_target = _normalize_phrase(payload.get("target", ""))
+        if legacy_target:
+            targets = [legacy_target]
+
+    if not targets:
+        legacy_query = _normalize_phrase(payload.get("query", ""))
+        if legacy_query:
+            targets = [legacy_query]
+
+    if not targets:
+        raise ValueError("LLM extraction output is missing valid targets")
+
+    return {
+        "targets": targets,
+        "anchors": anchors,
+        "support_surfaces": support_surfaces,
+    }
+
+
 async def extract(query, model):
     with open("llm/openie.txt", "r") as file:
         ie_prompt = file.read()
-    text = await model.generate(ie_prompt.format_map({"query": query}))
-    text = ast.literal_eval(text)["query"]
-    return text
+    raw_text = await model.generate(ie_prompt.format_map({"query": query}))
+    return parse_extraction_payload(raw_text)
 
 
 async def extract_handler(query, queue, model):
-    text = await extract(query, model)
-    queue.append(text)
+    extraction = await extract(query, model)
+    queue.append(extraction)
 
 
 def load_model(model):
@@ -245,7 +299,15 @@ class GroundingWorker:
         self.thread.start()
         return self
 
-    def submit(self, frame, text, request_id):
+    def submit(
+        self,
+        frame,
+        text,
+        request_id,
+        job_type="target",
+        box_threshold=None,
+        text_threshold=None,
+    ):
         with self.lock:
             if self.busy:
                 return False
@@ -253,6 +315,9 @@ class GroundingWorker:
                 "frame": frame.copy(),
                 "text": text,
                 "request_id": request_id,
+                "job_type": job_type,
+                "box_threshold": box_threshold,
+                "text_threshold": text_threshold,
             }
             self.busy = True
             return True
@@ -276,13 +341,21 @@ class GroundingWorker:
                 continue
 
             try:
+                job_box_threshold = job["box_threshold"]
+                if job_box_threshold is None:
+                    job_box_threshold = self.box_threshold
+
+                job_text_threshold = job["text_threshold"]
+                if job_text_threshold is None:
+                    job_text_threshold = self.text_threshold
+
                 result = run_grounding(
                     self.grounding_processor,
                     self.grounding_model,
                     job["frame"],
                     job["text"],
-                    box_threshold=self.box_threshold,
-                    text_threshold=self.text_threshold,
+                    box_threshold=job_box_threshold,
+                    text_threshold=job_text_threshold,
                 )
             except Exception as e:
                 with self.lock:
@@ -291,6 +364,7 @@ class GroundingWorker:
                         "frame": job["frame"],
                         "text": job["text"],
                         "request_id": job["request_id"],
+                        "job_type": job["job_type"],
                         "error": str(e),
                     }
                     self.busy = False
@@ -302,6 +376,7 @@ class GroundingWorker:
                     "frame": job["frame"],
                     "text": job["text"],
                     "request_id": job["request_id"],
+                    "job_type": job["job_type"],
                     "error": None,
                 }
                 self.busy = False

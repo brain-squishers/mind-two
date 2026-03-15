@@ -1,16 +1,35 @@
-Extract the object from the query or determine the tool that meets the query's intent, ending with a period.
+Extract a structured scene-search plan from the user query.
+
+Return exactly one Python dictionary with these keys:
+- "targets": a ranked list of target object phrases
+- "anchors": a list of nearby reference object phrases
+- "support_surfaces": a list of surfaces or locations that may contain the target
+
+Rules:
+- Keep phrases short and concrete.
+- Use singular noun phrases when possible.
+- Order "targets" from most likely to less likely.
+- Keep "targets" to 1 to 3 items.
+- Keep "anchors" and "support_surfaces" concise and relevant.
+- Do not include explanations.
+- Do not include any text outside the dictionary.
+- If a field has no good candidates, return an empty list for that field.
+- "targets" must always contain at least one non-empty string.
 
 Example 1:
-Query: pick a tool for communicate.
-Object: iphone.
+Query: I am trying to find my phone.
+Response:
+{{"targets": ["phone"], "anchors": ["water bottle", "laptop", "keyboard"], "support_surfaces": ["table", "desk", "bed"]}}
 
 Example 2:
-Query: I am tired.
-Object: chair.
+Query: I wanna drink something.
+Response:
+{{"targets": ["cup", "glass", "can"], "anchors": ["water bottle", "kettle", "bottle"], "support_surfaces": ["table", "desk", "counter"]}}
+
+Example 3:
+Query: I need something to write with.
+Response:
+{{"targets": ["pen", "pencil", "marker"], "anchors": ["notebook", "laptop", "book"], "support_surfaces": ["desk", "table", "shelf"]}}
 
 Query: {query}
-Object:
-
-Provide the response as a dictionary with the key "query" and the object's value as a string, with no additional text.
-
-Example response: {{"query": "iphone."}}
+Response:
