@@ -88,7 +88,7 @@ or huggingface version (recommend)
 
 ```bash
 cd gdino_checkpoints
-huggingface-cli download IDEA-Research/grounding-dino-tiny --local-dir grounding-dino-tiny
+hf download IDEA-Research/grounding-dino-tiny --local-dir grounding-dino-tiny
 ```
 
 4. Download LLM
@@ -111,7 +111,7 @@ API_BASE = "xxx"
 
 ```bash
 cd llm_checkpoints
-huggingface-cli download Qwen/Qwen2-7B-Instruct-AWQ --local-dir Qwen2-7B-Instruct-AWQ
+hf download Qwen/Qwen2-7B-Instruct-AWQ --local-dir Qwen2-7B-Instruct-AWQ
 ```
 install the corresponding packages
 

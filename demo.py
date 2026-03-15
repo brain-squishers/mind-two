@@ -1,7 +1,6 @@
 import os
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
 import cv2
 import imageio
 from PIL import Image
@@ -11,7 +10,7 @@ import time
 import collections
 import argparse
 
-from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection 
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
 from sam2.build_sam import build_sam2_camera_predictor
 from llm.gpt4o_modeling import GPT4o
@@ -28,25 +27,29 @@ if torch.cuda.get_device_properties(0).major >= 8:
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("device", device)
 
+
 async def extract(query, model):
     with open("llm/openie.txt", "r") as file:
         ie_prompt = file.read()
     text = await model.generate(ie_prompt.format_map({"query": query}))
     text = ast.literal_eval(text)["query"]
-    
+
     return text
+
 
 async def extract_handler(query, queue, model):
     text = await extract(query, model)
     queue.append(text)
 
-def load_model(model):
 
+def load_model(model):
     # init grounding dino model from huggingface
     # model_id = "IDEA-Research/grounding-dino-tiny"
     model_id = "gdino_checkpoints/grounding-dino-tiny"
     grounding_processor = AutoProcessor.from_pretrained(model_id)
-    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
+    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(
+        device
+    )
 
     # build sam2
     sam2_checkpoint = "checkpoints/sam2_hiera_small.pt"
@@ -54,48 +57,53 @@ def load_model(model):
     model_cfg = "sam2_hiera_s.yaml"
     predictor = build_sam2_camera_predictor(model_cfg, sam2_checkpoint, device=device)
 
-    if 'gpt' in model.lower(): # "gpt-4o-2024-05-13"
+    if "gpt" in model.lower():  # "gpt-4o-2024-05-13"
         gpt4o = GPT4o(model)
         return grounding_processor, grounding_model, predictor, gpt4o
-    elif 'qwen' in model.lower(): # "llm_checkpoints/Qwen2-7B-Instruct-AWQ"
+    elif "qwen" in model.lower():  # "llm_checkpoints/Qwen2-7B-Instruct-AWQ"
         qwen2 = Qwen2(f"llm_checkpoints/{model}", device=device)
         return grounding_processor, grounding_model, predictor, qwen2
     else:
         raise NotImplementedError("INVALID MODEL NAME")
 
 
-
-async def main(model="gpt-4o-2024-05-13"):
-    
+async def main(
+    model="gpt-4o-2024-05-13", camera_index=0, video_path=None, max_frames=50
+):
     # load model
     grounding_processor, grounding_model, predictor, llm = load_model(model)
-    
-    # load video
-    # cap = cv2.VideoCapture(0) # camera
-    cap = cv2.VideoCapture("notebooks/videos/case.mp4")
-    
+
+    # load video source
+    source = camera_index if camera_index is not None else video_path
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video source: {source}")
+
     # init
     query_queue = collections.deque([])
     response_queue = collections.deque([])
     if_init = False
-    frame_list = [] # for visualization
+    frame_list = []  # for visualization
     text = ""
     query = ""
     results = None
-    
+
     idx = 0
     # fps_cut = 2 # skip every fps_cut step to save time
     while True:
-        idx += 1    
+        idx += 1
         print(idx)
+        if max_frames is not None and idx > max_frames:
+            break
         ret, frame = cap.read()
         if not ret:
             break
         # if idx % fps_cut == 0: continue
-        
+
         # simulate query
         if idx == 1:
-            query = "I am thirsty"
+            # query = "I am thirsty"
+            query = "I am trying to find my glass"
             query_queue.append(query)
         if idx == 51:
             query = "find a tool for writing."
@@ -110,27 +118,30 @@ async def main(model="gpt-4o-2024-05-13"):
             if_init = False
 
         if text:
-            width, height = frame.shape[:2][::-1]    
+            width, height = frame.shape[:2][::-1]
             if not if_init:
                 predictor.load_first_frame(frame)
-                
 
                 ann_frame_idx = 0  # the frame index we interact with
                 ann_obj_id = 2  # give a unique id to each object we interact with (it can be any integers)
-                
+
                 # box from groundingDINO
                 # print(frame.shape)
-                inputs = grounding_processor(images=Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), text=text, return_tensors="pt").to(device)
+                inputs = grounding_processor(
+                    images=Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)),
+                    text=text,
+                    return_tensors="pt",
+                ).to(device)
                 with torch.no_grad():
                     outputs = grounding_model(**inputs)
                 results = grounding_processor.post_process_grounded_object_detection(
                     outputs,
                     inputs.input_ids,
-                    box_threshold=0.6,
+                    threshold=0.6,
                     text_threshold=0.6,
-                    target_sizes=[frame.shape[:2]]
+                    target_sizes=[frame.shape[:2]],
                 )
-                
+
                 # single box
                 boxes = results[0]["boxes"]
                 if boxes.shape[0] != 0:
@@ -142,8 +153,7 @@ async def main(model="gpt-4o-2024-05-13"):
                     if_init = True
                 else:
                     if_init = False
-                
-                
+
                 # continue
 
             else:
@@ -152,37 +162,34 @@ async def main(model="gpt-4o-2024-05-13"):
                 all_mask = np.zeros((height, width, 1), dtype=np.uint8)
                 # print(all_mask.shape)
                 for i in range(0, len(out_obj_ids)):
-                    out_mask = (out_mask_logits[i] > 0.0).permute(1, 2, 0).cpu().numpy().astype(
-                        np.uint8
-                    ) * 255
+                    out_mask = (out_mask_logits[i] > 0.0).permute(
+                        1, 2, 0
+                    ).cpu().numpy().astype(np.uint8) * 255
 
                     all_mask = cv2.bitwise_or(all_mask, out_mask)
 
                 # print(all_mask.shape, type(all_mask))
 
-
                 # all_mask = cv2.cvtColor(all_mask, cv2.COLOR_GRAY2BGR)
                 all_mask = cv2.cvtColor(all_mask, cv2.COLOR_GRAY2RGB)
                 frame = cv2.addWeighted(frame, 1, all_mask, 0.5, 0)
-        
+
         if query:
             frame = add_text_with_background(frame, query)
 
             # cv2.imshow("frame", frame)
             # cv2.imwrite(f"output/frame_{idx}.jpg", frame)
             # idx += 1
-            
+
         # Ensure tasks are running
         await asyncio.sleep(0)
 
-        
         frame_list.append(frame)
         # result.write(frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
-    
-    # visualization 
+    # visualization
     frame_list = [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in frame_list]
     gif = imageio.mimsave("./result.gif", frame_list, "GIF")
     # w, h = frame_list[0].shape[:2][::-1]
@@ -194,14 +201,44 @@ async def main(model="gpt-4o-2024-05-13"):
     # for frame in frame_list:
     #     video_handler.write(frame)
     # video_handler.release()
-    
+
     cap.release()
     cv2.destroyAllWindows()
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Run the system with a specified model.')
-    parser.add_argument('--model', type=str, required=True, help='The llm to use for the system.')
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Run the system with a specified model."
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="gpt-4o-2024-05-13",
+        help="The llm to use for the system.",
+    )
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=50,
+        help="Maximum number of frames to process before stopping.",
+    )
+    source_group = parser.add_mutually_exclusive_group()
+    source_group.add_argument(
+        "--camera-index",
+        type=int,
+        default=0,
+        help="Camera index to use for live capture.",
+    )
+    source_group.add_argument(
+        "--video-path", type=str, help="Video file to use as input."
+    )
     args = parser.parse_args()
-    
-    asyncio.run(main(args.model))
+
+    asyncio.run(
+        main(
+            args.model,
+            camera_index=args.camera_index,
+            video_path=args.video_path,
+            max_frames=args.max_frames,
+        )
+    )

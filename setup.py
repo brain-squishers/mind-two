@@ -31,7 +31,9 @@ REQUIRED_PACKAGES = [
     "pillow>=9.4.0",
     "opencv-python>=4.7.0",
     "python-dotenv",
-    "imageio"
+    "imageio",
+    "transformers>=4.33.2",
+    "openai>=1.0.0",
 ]
 
 EXTRA_PACKAGES = {
